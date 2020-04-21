@@ -4,12 +4,12 @@
 /**
  * Encoding conversion (MySQL).
  * Fix collation and encoding of a specific database/tables/columns; also, fixes issues with indices.
- * 
+ *
  * @see https://mathiasbynens.be/notes/mysql-utf8mb4
  * @see https://medium.com/@alexBerg/my-war-with-mysql-or-how-did-i-switch-to-full-utf8mb4-73b257083ac8
  * @see https://medium.com/tensult/converting-rds-mysql-file-format-from-antelope-to-barracuda-ba8a60b2c1ec
  */
-class BdEncodingConversor {
+class DbEncodingConversor {
     /**
      * @type int
      */
@@ -31,18 +31,18 @@ class BdEncodingConversor {
     private $_indices = [];
 
     /**
-     * @param string $sHost
-     * @param string $sDb
+     * @param string $host
+     * @param string $database
      * @return void
      */
-    public function __constructor (string $host, string $database) {
+    public function __construct (string $host, string $database) {
         if (!defined('PDO::ATTR_DRIVER_NAME')) {
             echo "PDO is not installed in your system...\n";
             exit;
         }
 
         $password  = self::_getPassword('Enter MySQL root password: ');
-        
+
         $dns = sprintf('%s:dbname=%s;host=%s;charset=%s', 'mysql', $database, $host, 'utf8mb4');
         try {
             $this->_PDOObject = new PDO($dns, 'root', $password);
@@ -58,7 +58,7 @@ class BdEncodingConversor {
     }
 
     public function run() {
-        $tablesData = $this->_getDbTablesData($this->_database, $this->_PDOObject);
+        $tablesData = $this->_getDbTablesData();
 
         $this->_changeDatabaseEncoding();
 
@@ -78,7 +78,7 @@ class BdEncodingConversor {
 
                 $isNull = $column['nullable'] ? 'NULL' : 'NOT NULL';
 
-                // If type is (VAR)CHAR, adjust the byte limit and mark all indices 
+                // If type is (VAR)CHAR, adjust the byte limit and mark all indices
                 // associated with it to be updated
                 if ($column['type'] === 'char' || $column['type'] === 'varchar') {
                     $this->_verifyColumnStructure($table, $column);
@@ -100,24 +100,24 @@ class BdEncodingConversor {
                 $this->_addStoredIndices($table);
             }
         }
-        
-        foreach (array_keys($aDbInfo) as $table) {
+
+        foreach (array_keys($tablesData) as $table) {
             // This statements allows the table to accept the `Barracuda` file type properly
-            $oStmt = $this->_PDOObject->prepare("ALTER TABLE `{$sDb}`.`{$table}` ROW_FORMAT=DYNAMIC");
+            $oStmt = $this->_PDOObject->prepare("ALTER TABLE `{$this->_database}`.`{$table}` ROW_FORMAT=DYNAMIC");
             $oStmt->execute();
-            
+
             $oStmt = $this->_PDOObject->prepare("
-                             ALTER TABLE `{$sDb}`.`{$table}` 
+                             ALTER TABLE `{$this->_database}`.`{$table}` 
                 CONVERT TO CHARACTER SET utf8mb4
                                  COLLATE utf8mb4_unicode_ci");
             $oStmt->execute();
-            
-            $oRepairStmt = $this->_PDOObject->prepare("REPAIR TABLE `{$sDb}`.`{$table}`");
+
+            $oRepairStmt = $this->_PDOObject->prepare("REPAIR TABLE `{$this->_database}`.`{$table}`");
             $oRepairStmt->execute();
-            
-            $oOptimizeStmt = $this->_PDOObject->prepare("OPTIMIZE TABLE `{$sDb}`.`{$table}`");
+
+            $oOptimizeStmt = $this->_PDOObject->prepare("OPTIMIZE TABLE `{$this->_database}`.`{$table}`");
             $oOptimizeStmt->execute();
-            
+
             echo "Fixed encoding/repaired/optimized `{$table}`\n";
         }
 
@@ -130,15 +130,18 @@ class BdEncodingConversor {
      * @param string $sPrompt
      * @return string
      */
-    private static function _getPassword (string $sPrompt = "Enter Password: ") {
-        echo $sPrompt;
+    private static function _getPassword (string $prompt = "Enter Password: ") {
+        echo $prompt;
         system('stty -echo');
-        $sPassword = trim(fgets(STDIN));
+        $password = trim(fgets(STDIN));
         system('stty echo');
         echo "\n";
-        return $sPassword;
+        return $password;
     }
 
+    /**
+     * @return array
+     */
     private function _getDbTablesData() {
         $query = "
             SELECT  table_name, column_name, data_type, IF(is_nullable='YES', 1, 0) as nullable, 
@@ -158,36 +161,49 @@ class BdEncodingConversor {
         return $tablesData;
     }
 
+    /**
+     *
+     */
     private function _changeDatabaseEncoding() {
         $oStmt = $this->_PDOObject->prepare("ALTER DATABASE `{$this->_database}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
         $oStmt->execute();
         echo "Altered database charset and collation\n";
     }
 
+    /**
+     * @param string $table
+     * @param array $columnData
+     */
     private function _verifyColumnStructure(string $table, array &$columnData) {
+        $length = self::$_maxLength;
         $statement = $this->_PDOObject->prepare("
-            SELECT 1 FROM `{$sDb}`.`{$table}` WHERE LENGTH({$columnData['column']}) > {self::$_maxLength}");
+            SELECT 1 FROM `{$this->_database}`.`{$table}` WHERE LENGTH({$columnData['column']}) > {$length}");
         $statement->execute();
         $result = $statement->fetch();
 
         if ($result) {
             $columnData['type'] = 'TINYTEXT';
-            echo "Changed field type for `{$table}.{$column['column']}`\n";
-            $this->_collectColumnIndexRef($table, $column['column']);
+            echo "Changed field type for `{$table}.{$columnData['column']}`\n";
+            $this->_collectColumnIndexRef($table, $columnData['column']);
         } else {
-            $columnData['type'] .= "({self::$_maxLength})";
+            $columnData['type'] .= "({$length})";
         }
     }
 
+    /**
+     * @param string $table
+     * @param string $column
+     */
     private function _collectColumnIndexRef(string $table, string $column) {
+        $length = self::$_maxLength;
         $results = $this->_PDOObject->query("SHOW INDEX FROM `{$this->_database}`.`{$table}`");
         foreach ($results as $index) {
-            if ($index['Column_name'] === $column['column']) {
+            if ($index['Column_name'] === $column) {
                 if (!isset($this->_indices[$index['Key_name']])) {
                     $this->_indices[$index['Key_name']] = [
                         'name'    => $index['Key_name'],
                         'unique'  => $index['Non_unique'] === 0,
-                        'columns' => ["`{$column['column']}`({self::$_maxLength})"],
+                        'columns' => ["`{$column}`({$length})"],
                         'deleted' => false,
                     ];
                 }
@@ -196,7 +212,7 @@ class BdEncodingConversor {
 
         foreach ($results as $index) {
             if (isset($this->_indices[$index['Key_name']]) && !$this->_indices[$index['Key_name']]['deleted']) {
-                if (in_array("`{$index['Column_name']}`({self::$_maxLength})", $this->_indices[$index['Key_name']]['columns'])) {
+                if (in_array("`{$index['Column_name']}`({$length})", $this->_indices[$index['Key_name']]['columns'])) {
                     continue;
                 }
                 $this->_indices[$index['Key_name']]['columns'][] = '`' . $index['Column_name'] . '`';
@@ -204,6 +220,9 @@ class BdEncodingConversor {
         }
     }
 
+    /**
+     * @param string $table
+     */
     private function _dropStoredIndices(string $table) {
         foreach (array_keys($this->_indices) as $index) {
             $indexStmt = $this->_PDOObject->prepare("ALTER TABLE {$table} DROP INDEX {$index}");
@@ -212,6 +231,9 @@ class BdEncodingConversor {
         }
     }
 
+    /**
+     * @param string $table
+     */
     private function _addStoredIndices(string $table) {
         foreach ($this->_indices as $indexName => $indexData) {
             $indexColumns = implode(',', $indexData['columns']);
@@ -228,5 +250,6 @@ class BdEncodingConversor {
     }
 }
 
-$oConversor = new BdEncodingConversor($argv[1], $argv[2]);
+
+$oConversor = new DbEncodingConversor($argv[1], $argv[2]);
 $oConversor->run();
